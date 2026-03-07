@@ -1,0 +1,147 @@
+# TreeRL 配置文件示例
+# 使用方法：python -m recipe.treerl_v2.main_treerl --config-path=config --config-name=treerl_config
+
+# ==============================================================================
+# 数据配置
+# ==============================================================================
+data:
+  train_files: data/gsm8k/train.parquet
+  val_files: data/gsm8k/test.parquet
+  prompt_key: prompt
+  truncation: left
+  max_prompt_length: 512
+  max_response_length: 2048
+  train_batch_size: 128
+
+# ==============================================================================
+# 模型配置
+# ==============================================================================
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen2.5-7B-Instruct
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+  
+  # ==============================================================================
+  # Actor 配置
+  # ==============================================================================
+  actor:
+    ppo_mini_batch_size: 16
+    optim:
+      lr: 1.0e-6
+      lr_warmup_steps: 100
+      weight_decay: 0.01
+    policy_loss:
+      loss_mode: vanilla
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.2
+    clip_ratio_c: 10.0
+    entropy_coeff: 0
+    grad_clip: 1.0
+    loss_agg_mode: token-mean
+    use_dynamic_bsz: true
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+      fsdp_size: -1
+    use_kl_loss: true
+    kl_loss_coef: 0.05
+  
+  # ==============================================================================
+  # Reference Policy 配置
+  # ==============================================================================
+  ref:
+    fsdp_config:
+      param_offload: false
+    log_prob_use_dynamic_bsz: true
+  
+  # ==============================================================================
+  # Rollout 配置
+  # ==============================================================================
+  rollout:
+    n: 1  # TreeRL 内部处理多轨迹，这里设置为 1
+    name: vllm
+    mode: async
+    temperature: 0.7
+    top_p: 0.95
+    top_k: -1
+    tensor_model_parallel_size: 2
+    gpu_memory_utilization: 0.5
+    enable_chunked_prefill: true
+    enforce_eager: false
+    free_cache_engine: true
+    val_kwargs:
+      temperature: 0.7
+      top_p: 0.95
+      top_k: -1
+      do_sample: true
+      n: 1
+    
+    # TreeRL Agent Loop Manager
+    agent:
+      agent_loop_manager_class: recipe.treerl_v2.agent_loop.TreeRLAgentLoopManager
+      num_workers: 1
+
+# ==============================================================================
+# Critic 配置（TreeRL 不使用 Critic）
+# ==============================================================================
+critic:
+  model:
+    path: null  # 禁用 Critic
+
+# ==============================================================================
+# 算法配置
+# ==============================================================================
+algorithm:
+  # RLOO 优势估计
+  adv_estimator: rloo
+  
+  # KL 控制
+  use_kl_in_reward: true
+  kl_penalty: kl
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.05
+  
+  # ========================================
+  # TreeRL 树搜索参数
+  # ========================================
+  m: 6                      # 初始树的数量
+  n: 2                      # 每轮扩展的高熵 token 数量
+  l: 1                      # 扩展迭代轮数
+  t: 2                      # 每个熵点的分支数量
+  num_traces: 16            # 每个 prompt 采样的训练轨迹数
+
+# ==============================================================================
+# 奖励模型配置
+# ==============================================================================
+reward_model:
+  enable: false  # 使用 reward_manager 而不是 reward model
+  reward_manager: dapo
+  use_reward_loop: false
+  reward_kwargs:
+    overlong_buffer_cfg:
+      enable: true
+      len: 1024
+      penalty_factor: 0.1
+      log: false
+    max_resp_len: 2048
+
+# ==============================================================================
+# Trainer 配置
+# ==============================================================================
+trainer:
+  logger:
+    - tensorboard
+    - console
+  project_name: treerl
+  experiment_name: treerl_gsm8k_7b
+  n_gpus_per_node: 8
+  nnodes: 1
+  val_before_train: true
+  test_freq: 1
+  save_freq: 1
+  total_epochs: 10
+  default_local_dir: /tmp/treerl/ckpts
+  resume_mode: auto
+  device: npu

@@ -1,0 +1,166 @@
+# TreeRL Parallel Configuration for verl 0.7.0
+# Optimized for multi-GPU training
+
+# ================== Actor & Rollout & Reference ==================
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen2.5-Math-1.5B-Instruct
+    external_lib: null
+    enable_gradient_checkpointing: true
+    trust_remote_code: true
+    use_remove_padding: true
+  
+  actor:
+    strategy: fsdp
+    ppo_mini_batch_size: 16
+    ppo_micro_batch_size: 4
+    grad_clip: 1.0
+    clip_ratio: 0.2
+  
+  rollout:
+    temperature: 0.7
+    top_k: -1
+    top_p: 0.95
+    n: 1
+    log_prob_micro_batch_size: 16  # Increased for batch generation
+    max_new_tokens: 2048
+    
+    # vLLM optimization
+    vllm:
+      enable: true
+      tensor_parallel_size: 2  # Use multiple GPUs for inference
+      gpu_memory_utilization: 0.9
+      max_num_batched_tokens: 32768  # Larger batch for tree search
+  
+  ref:
+    strategy: fsdp
+    log_prob_micro_batch_size: null
+
+# ================== Critic (Not used in TreeRL) ==================
+critic:
+  model:
+    path: null
+  ppo_micro_batch_size: null
+  strategy: null
+
+# ================== Reward Model ==================
+reward_model:
+  enable: false
+  model:
+    path: null
+  micro_batch_size: null
+  strategy: null
+
+# ================== Data ==================
+data:
+  train_files: data/gsm8k/train.parquet
+  val_files: data/gsm8k/test.parquet
+  max_prompt_length: 512
+  max_response_length: 2048
+  train_batch_size: 16  # Increased - parallel processing handles this efficiently
+  val_batch_size: 32
+  shuffle: true
+  seed: 42
+  max_workers: 4
+  reward_fn_key: data_source
+
+# ================== Algorithm (TreeRL Specific) ==================
+algorithm:
+  # Tree Search Parameters
+  m: 6              # Number of initial trees
+  n: 2              # Top-N entropy tokens to expand per iteration
+  l: 1              # Number of expansion iterations
+  t: 2              # Number of branches per entropy point
+  num_traces: 16    # Number of traces to sample for training per prompt
+  
+  # Advantage Estimation
+  adv_estimator: rloo
+  
+  # KL Divergence
+  use_kl_in_reward: false
+  use_kl_loss: false
+  
+  # Discount Factor
+  gamma: 1.0
+  
+  # Normalization
+  use_adv_norm: false
+
+# ================== Parallel Optimization ==================
+parallel:
+  # Number of prompts to process in parallel (for fully parallel mode)
+  num_parallel_prompts: 4
+  
+  # Number of trees to expand in parallel per batch
+  num_parallel_trees: 8
+  
+  # Enable vLLM continuous batching
+  enable_continuous_batching: true
+  
+  # Batch size for initial response generation (M * num_parallel_prompts)
+  initial_batch_size: 24
+  
+  # Batch size for expansion generation
+  expansion_batch_size: 32
+
+# ================== Trainer ==================
+trainer:
+  strategy: fsdp
+  project_name: treerl-parallel
+  experiment_name: qwen2.5-math-1.5b-gsm8k-parallel
+  total_epochs: 4
+  total_training_steps: null
+  save_freq: 500
+  test_freq: 100
+  log_freq: 10
+  checkpoint_dir: checkpoints/treerl_parallel
+  do_validation: true
+  val_only: false
+  
+  optimizer:
+    name: adamw
+    lr: 1.0e-6
+    weight_decay: 0.01
+    betas: [0.9, 0.95]
+    
+  scheduler:
+    name: cosine
+    warmup_steps: 100
+    warmup_ratio: 0.05
+
+# ================== Resource Pool ==================
+resource_pool:
+  actor_rollout:
+    num_gpus: 8  # Increased for parallel inference
+    memory: 16G
+  ref:
+    num_gpus: 2
+    memory: 8G
+  critic:
+    num_gpus: 0
+  reward:
+    num_gpus: 0
+
+# ================== Custom ==================
+custom:
+  reward_function:
+    type: math
+    accuracy_threshold: 1.0
+  evaluation:
+    n_samples: 1
+    pass_k: [1, 2, 4, 8]
+
+# ================== Logging ==================
+logging:
+  wandb:
+    enable: false
+    entity: null
+    project: null
+  tensorboard:
+    enable: true
+    log_dir: logs/tensorboard
+
+# ================== Profiling ==================
+profiling:
+  enable: false
+  profile_steps: [10, 20]

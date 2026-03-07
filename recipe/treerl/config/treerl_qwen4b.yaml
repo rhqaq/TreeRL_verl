@@ -1,0 +1,144 @@
+# TreeRL Configuration for verl 0.7.0
+# Entropy-Guided Tree Search for Mathematical Reasoning
+
+# ================== Actor & Rollout & Reference ==================
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen2.5-Math-1.5B-Instruct
+    external_lib: null
+    enable_gradient_checkpointing: true
+    trust_remote_code: true
+    use_remove_padding: true
+  
+  actor:
+    strategy: fsdp  # DeepSpeed/FSDP
+    ppo_mini_batch_size: 16
+    ppo_micro_batch_size: 4
+    grad_clip: 1.0
+    clip_ratio: 0.2  # Not used in REINFORCE but kept for compatibility
+  
+  rollout:
+    temperature: 0.7
+    top_k: -1
+    top_p: 0.95
+    n: 1  # We use tree search for multiple generations
+    log_prob_micro_batch_size: 8
+    max_new_tokens: 2048
+  
+  ref:
+    strategy: fsdp
+    log_prob_micro_batch_size: null
+
+# ================== Critic (Not used in TreeRL) ==================
+critic:
+  model:
+    path: null  # No critic model
+  ppo_micro_batch_size: null
+  strategy: null
+
+# ================== Reward Model ==================
+reward_model:
+  enable: false  # We compute rewards during tree search
+  model:
+    path: null
+  micro_batch_size: null
+  strategy: null
+
+# ================== Data ==================
+data:
+  train_files: data/gsm8k/train.parquet
+  val_files: data/gsm8k/test.parquet
+  max_prompt_length: 512
+  max_response_length: 2048
+  train_batch_size: 8  # Prompts per batch (will expand to num_traces each)
+  val_batch_size: 16
+  shuffle: true
+  seed: 42
+  max_workers: 4
+  reward_fn_key: data_source  # Key in data for reward function selection
+
+# ================== Algorithm (TreeRL Specific) ==================
+algorithm:
+  # Tree Search Parameters
+  m: 6              # Number of initial trees (number of initial responses)
+  n: 2              # Top-N entropy tokens to expand per iteration
+  l: 1              # Number of expansion iterations
+  t: 2              # Number of branches per entropy point
+  num_traces: 16    # Number of traces to sample for training per prompt
+  
+  # Advantage Estimation
+  adv_estimator: rloo  # RLOO (Reward Leave-One-Out)
+  
+  # KL Divergence
+  use_kl_in_reward: false  # TreeRL doesn't use KL penalty
+  use_kl_loss: false
+  
+  # Discount Factor (not used in REINFORCE)
+  gamma: 1.0
+  
+  # Normalization
+  use_adv_norm: false  # RLOO handles normalization
+
+# ================== Trainer ==================
+trainer:
+  strategy: fsdp
+  project_name: treerl
+  experiment_name: qwen2.5-math-1.5b-gsm8k
+  total_epochs: 4
+  total_training_steps: null
+  save_freq: 500
+  test_freq: 100
+  log_freq: 10
+  checkpoint_dir: checkpoints/treerl_qwen4b
+  do_validation: true
+  val_only: false
+  
+  # Optimizer
+  optimizer:
+    name: adamw
+    lr: 1.0e-6
+    weight_decay: 0.01
+    betas: [0.9, 0.95]
+    
+  # LR Scheduler
+  scheduler:
+    name: cosine
+    warmup_steps: 100
+    warmup_ratio: 0.05
+
+# ================== Resource Pool ==================
+resource_pool:
+  actor_rollout:
+    num_gpus: 4
+    memory: 16G
+  ref:
+    num_gpus: 1
+    memory: 8G
+  critic:
+    num_gpus: 0
+  reward:
+    num_gpus: 0
+
+# ================== Custom ==================
+custom:
+  reward_function:
+    type: math  # math, code, general
+    accuracy_threshold: 1.0
+  evaluation:
+    n_samples: 1  # Greedy for validation
+    pass_k: [1, 2, 4]  # Compute pass@k for k in list
+
+# ================== Logging ==================
+logging:
+  wandb:
+    enable: false
+    entity: null
+    project: null
+  tensorboard:
+    enable: true
+    log_dir: logs/tensorboard
+
+# ================== Profiling ==================
+profiling:
+  enable: false
+  profile_steps: [10, 20]
