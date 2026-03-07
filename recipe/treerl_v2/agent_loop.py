@@ -2,10 +2,11 @@
 TreeRL Agent Loop - 熵引导树搜索实现
 
 继承 AgentLoopManager，在 generate_sequences 中实现树搜索算法。
-使用 DAPORewardManager 进行真实奖励评估。
+直接使用 math_dapo.compute_score 进行答案验证（不使用 DAPORewardManager）。
 """
 
 import asyncio
+import random
 import time
 from typing import Any, Optional, List, Dict, Tuple
 from dataclasses import dataclass, field
@@ -19,7 +20,7 @@ from tensordict import TensorDict
 
 from verl.experimental.agent_loop import AgentLoopManager, AgentLoopWorker
 from verl.protocol import DataProto
-from verl.workers.reward_manager import DAPORewardManager
+from verl.utils.reward_score import math_dapo
 
 
 # ==============================================================================
@@ -84,6 +85,70 @@ class TreeNode:
 
 
 # ==============================================================================
+# RLOO 优势计算
+# ==============================================================================
+def compute_rloo_advantages(
+    rewards: torch.Tensor,
+    log_probs: torch.Tensor,
+    masks: torch.Tensor,
+    num_samples_per_prompt: int,
+    min_threshold: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    计算 RLOO (Reinforcement Learning with Opponent Learning) 优势。
+    
+    RLOO 的核心思想（与 TreeRL 原始实现一致）：
+    - 对于每个样本，使用同一 prompt 下其他样本的平均奖励作为 baseline
+    - baseline = (sum - current) / (num_samples - 1)
+    - advantage = reward - baseline
+    - 这避免了需要单独的 value function
+    
+    Args:
+        rewards: [batch_size] 每个样本的奖励
+        log_probs: [batch_size, seq_len] 每个 token 的 log probability
+        masks: [batch_size, seq_len] 有效 token 的 mask
+        num_samples_per_prompt: 每个 prompt 的样本数
+        min_threshold: 最小阈值，用于过滤小的优势
+        
+    Returns:
+        advantages: [batch_size, seq_len] token-level advantages
+        returns: [batch_size, seq_len] token-level returns
+    """
+    batch_size = rewards.shape[0]
+    
+    # 重塑为 [batch_size // num_samples_per_prompt, num_samples_per_prompt]
+    # 假设 batch 中 samples 是按 prompt 分组的
+    num_prompts = batch_size // num_samples_per_prompt
+    rewards_grouped = rewards.view(num_prompts, num_samples_per_prompt)
+    
+    # 计算 baseline: 其他样本的平均奖励（与 TreeRL 一致）
+    # baseline = (_sum - reward) / (num_samples - 1)
+    _sum = rewards_grouped.sum(dim=1, keepdim=True)
+    baseline = (_sum - rewards_grouped) / (num_samples_per_prompt - 1 + 1e-6)
+    
+    # 计算优势 = reward - baseline
+    advantages_grouped = rewards_grouped - baseline
+    
+    # 应用 lower_bound 确保优势不会太低（与 TreeRL 一致）
+    lower_bound = -advantages_grouped.max(dim=1, keepdim=True)[0]
+    advantages_grouped = torch.max(advantages_grouped, lower_bound)
+    
+    # 展开
+    advantages_scalar = advantages_grouped.view(batch_size)
+    
+    # 扩展为 token-level
+    seq_len = log_probs.shape[1] if log_probs.dim() > 1 else masks.shape[1]
+    advantages = advantages_scalar.unsqueeze(1).expand(-1, seq_len) * masks
+    returns = advantages.clone()
+    
+    print(f"RLOO: rewards_grouped = {rewards_grouped}")
+    print(f"RLOO: baseline = {baseline}")
+    print(f"RLOO: advantages_grouped = {advantages_grouped}")
+    
+    return advantages, returns
+
+
+# ==============================================================================
 # TreeRL AgentLoopManager
 # ==============================================================================
 class TreeRLAgentLoopManager(AgentLoopManager):
@@ -93,7 +158,7 @@ class TreeRLAgentLoopManager(AgentLoopManager):
     核心改动：
     1. 重写 generate_sequences，实现熵引导的树搜索
     2. 利用 AsyncLLMServerManager 进行批量生成
-    3. 使用 DAPORewardManager 进行真实奖励评估
+    3. 直接使用 math_dapo.compute_score 进行答案验证
     4. 实现 RLOO 优势估计
     """
     
@@ -109,23 +174,12 @@ class TreeRLAgentLoopManager(AgentLoopManager):
         # 调用父类初始化
         super().__init__(config, worker_group, rm_resource_pool)
         
-        # 初始化 tokenizer（用于 DAPORewardManager）
-        # 从 worker 获取或单独加载
+        # 初始化 tokenizer（用于解码响应文本）
         self._init_tokenizer_for_reward()
-        
-        # 初始化 DAPORewardManager（用于评估答案）
-        self.reward_manager = DAPORewardManager(
-            tokenizer=self.tokenizer,
-            num_examine=10,  # 打印前 10 个样本用于调试
-            compute_score=None,  # 使用 default_compute_score
-            reward_fn_key="data_source",
-            max_resp_len=self.max_response_length,
-            overlong_buffer_cfg=None,
-        )
         
         print(f"TreeRLAgentLoopManager initialized with:")
         print(f"  m={self.m}, n={self.n}, l={self.l}, t={self.t}, num_traces={self.num_traces}")
-        print(f"  Using DAPORewardManager for real reward evaluation")
+        print(f"  Using math_dapo.compute_score for real reward evaluation")
     
     def _init_tokenizer_for_reward(self):
         """初始化 tokenizer 用于奖励计算"""
@@ -143,8 +197,9 @@ class TreeRLAgentLoopManager(AgentLoopManager):
         流程：
         1. 对 batch 中每个 prompt，生成 M 个初始响应
         2. 进行 L 轮扩展，每轮选择 N 个高熵 token 进行 T 分支
-        3. 使用 DAPORewardManager 评估叶子节点，计算真实奖励
+        3. 使用 math_dapo.compute_score 评估叶子节点，计算真实奖励
         4. 采样 K 条轨迹用于训练
+        5. 计算 RLOO 优势
         """
         # Wake up servers
         self.wake_up()
@@ -166,18 +221,29 @@ class TreeRLAgentLoopManager(AgentLoopManager):
                 t=self.t,
                 num_traces=self.num_traces,
                 max_response_length=self.max_response_length,
+                tokenizer=self.tokenizer,
             )
             for worker, chunk in zip(self.agent_loop_workers, chunks)
         ])
         
         output = DataProto.concat(outputs)
         
-        # 使用 DAPORewardManager 计算真实奖励
-        if "token_level_scores" not in output.batch.keys():
-            # 构造 DataProto 用于奖励计算
-            reward_input = self._prepare_reward_input(output)
-            reward_tensor = self.reward_manager(reward_input)
-            output.batch["token_level_scores"] = reward_tensor
+        # 计算 RLOO 优势
+        if "token_level_scores" in output.batch:
+            rewards = output.batch["token_level_scores"].sum(dim=1)
+            log_probs = output.batch.get("rollout_log_probs", torch.zeros_like(rewards).unsqueeze(1))
+            masks = output.batch.get("response_mask", torch.ones_like(log_probs))
+            
+            # 假设每个 prompt 有 num_traces 个样本
+            advantages, returns = compute_rloo_advantages(
+                rewards=rewards,
+                log_probs=log_probs,
+                masks=masks,
+                num_samples_per_prompt=self.num_traces,
+            )
+            
+            output.batch["advantages"] = advantages
+            output.batch["returns"] = returns
         
         # Sleep servers
         self.sleep()
@@ -193,25 +259,6 @@ class TreeRLAgentLoopManager(AgentLoopManager):
             "tree_search/t": self.t,
         }
         output.meta_info["timing"] = timing
-        
-        return output
-    
-    def _prepare_reward_input(self, output: DataProto) -> DataProto:
-        """准备奖励计算的输入数据"""
-        # DAPORewardManager 需要：
-        # - prompts: [bsz, prompt_len]
-        # - responses: [bsz, response_len]
-        # - attention_mask: [bsz, prompt_len + response_len]
-        # - non_tensor_batch["reward_model"]["ground_truth"]
-        # - non_tensor_batch["data_source"]
-        
-        # 确保有必要的字段
-        if "prompts" not in output.batch:
-            # 从 input_ids 分离 prompt 和 response
-            # 假设 prompt_length 存储在 meta_info 或配置中
-            prompt_length = self.config.actor_rollout_ref.rollout.prompt_length
-            output.batch["prompts"] = output.batch["input_ids"][:, :prompt_length]
-            output.batch["responses"] = output.batch["input_ids"][:, prompt_length:]
         
         return output
 
@@ -236,6 +283,7 @@ class TreeRLAgentLoopWorker(AgentLoopWorker):
         t: int = 2,
         num_traces: int = 16,
         max_response_length: int = 2048,
+        tokenizer=None,
     ) -> DataProto:
         """
         对一个 batch 的 prompts 执行树搜索。
@@ -252,6 +300,7 @@ class TreeRLAgentLoopWorker(AgentLoopWorker):
                 m=m, n=n, l=l, t=t,
                 num_traces=num_traces,
                 max_response_length=max_response_length,
+                tokenizer=tokenizer,
             )
             for i in range(batch_size)
         ]
@@ -271,6 +320,7 @@ class TreeRLAgentLoopWorker(AgentLoopWorker):
         t: int,
         num_traces: int,
         max_response_length: int,
+        tokenizer=None,
     ) -> Dict[str, Any]:
         """
         对单个 prompt 执行树搜索。
@@ -279,7 +329,7 @@ class TreeRLAgentLoopWorker(AgentLoopWorker):
             "prompt_ids": List[int],
             "trace_ids": List[List[int]],  # num_traces 条轨迹
             "trace_log_probs": List[List[float]],
-            "trace_rewards": List[float],  # 每条轨迹的奖励（稍后由 DAPORewardManager 填充）
+            "trace_rewards": List[float],  # 每条轨迹的奖励（由 math_dapo.compute_score 计算）
             "trace_masks": List[List[int]],  # 哪些是生成的 token
             "ground_truth": Any,  # 用于奖励计算
             "data_source": str,   # 数据来源
@@ -294,11 +344,15 @@ class TreeRLAgentLoopWorker(AgentLoopWorker):
             prompt_ids = prompt_ids.tolist()
         
         # 获取 ground_truth 和 data_source（用于奖励计算）
-        ground_truth = batch.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
-        if ground_truth is not None and hasattr(ground_truth, '__getitem__'):
-            ground_truth = ground_truth[batch_idx]
+        ground_truth = None
+        if "reward_model" in batch.non_tensor_batch:
+            reward_info = batch.non_tensor_batch["reward_model"]
+            if reward_info is not None and hasattr(reward_info, '__getitem__'):
+                reward_item = reward_info[batch_idx]
+                if isinstance(reward_item, dict) and "ground_truth" in reward_item:
+                    ground_truth = reward_item["ground_truth"]
         
-        data_source = batch.non_tensor_batch.get("data_source", "unknown")
+        data_source = batch.non_tensor_batch.get("data_source", "math_dapo")
         if hasattr(data_source, '__getitem__'):
             data_source = data_source[batch_idx]
         
@@ -319,7 +373,14 @@ class TreeRLAgentLoopWorker(AgentLoopWorker):
                 max_response_length=max_response_length,
             )
         
-        # Step 3: 采样轨迹（奖励稍后计算）
+        # Step 3: 使用 math_dapo.compute_score 评估叶子节点
+        initial_trees = await self._evaluate_leaves(
+            trees=initial_trees,
+            ground_truth=ground_truth,
+            tokenizer=tokenizer,
+        )
+        
+        # Step 4: 采样轨迹（已包含真实奖励）
         traces = self._sample_traces(
             trees=initial_trees,
             num_traces=num_traces,
@@ -331,6 +392,7 @@ class TreeRLAgentLoopWorker(AgentLoopWorker):
             "trace_ids": [t["token_ids"] for t in traces],
             "trace_log_probs": [t["log_probs"] for t in traces],
             "trace_masks": [t["masks"] for t in traces],
+            "trace_rewards": [t["reward"] for t in traces],
             "ground_truth": ground_truth,
             "data_source": data_source,
         }
@@ -453,6 +515,47 @@ class TreeRLAgentLoopWorker(AgentLoopWorker):
         
         return trees
     
+    async def _evaluate_leaves(
+        self,
+        trees: List[TreeNode],
+        ground_truth: Optional[str],
+        tokenizer=None,
+    ) -> List[TreeNode]:
+        """
+        使用 math_dapo.compute_score 评估叶子节点的答案。
+        
+        这替代了 DAPORewardManager，直接在 Worker 中进行评估。
+        """
+        for tree in trees:
+            leaf_nodes = self._get_leaf_nodes(tree)
+            for leaf in leaf_nodes:
+                # 获取完整响应
+                full_ids = leaf.get_full_ids()
+                
+                # 解码响应文本
+                if tokenizer is not None:
+                    response_text = tokenizer.decode(full_ids, skip_special_tokens=True)
+                else:
+                    # 如果没有 tokenizer，使用占位符（实际使用时必须传入 tokenizer）
+                    response_text = str(full_ids)
+                
+                # 使用 math_dapo.compute_score 计算奖励
+                if ground_truth is not None:
+                    try:
+                        result = math_dapo.compute_score(
+                            solution_str=response_text,
+                            ground_truth=ground_truth,
+                        )
+                        # result 是字典，包含 score, acc, pred
+                        leaf.binary_score = float(result.get("score", 0.0))
+                    except Exception as e:
+                        print(f"Warning: compute_score failed: {e}")
+                        leaf.binary_score = 0.0
+                else:
+                    leaf.binary_score = 0.0
+        
+        return trees
+    
     def _get_all_nodes(self, root: TreeNode) -> List[TreeNode]:
         """获取树中所有节点"""
         nodes = [root]
@@ -478,19 +581,33 @@ class TreeRLAgentLoopWorker(AgentLoopWorker):
         从树中采样轨迹用于训练。
         
         策略：
-        1. 收集所有叶子节点
-        2. 随机采样（因为奖励稍后计算）
+        1. 收集所有叶子节点（已包含奖励）
+        2. 按奖励加权采样（高奖励的轨迹被采样的概率更高）
         """
         all_leaves = []
         for tree in trees:
             all_leaves.extend(self._get_leaf_nodes(tree))
         
-        # 随机打乱
-        import random
-        random.shuffle(all_leaves)
+        if not all_leaves:
+            return []
         
-        # 采样 num_traces 条
-        sampled = all_leaves[:num_traces]
+        # 计算采样权重（基于奖励）
+        rewards = np.array([leaf.binary_score for leaf in all_leaves])
+        # 使用 softmax 归一化，确保高奖励的轨迹有更高的概率
+        if rewards.std() > 1e-6:
+            weights = np.exp(rewards - rewards.max())  # 数值稳定性
+            weights = weights / weights.sum()
+        else:
+            weights = np.ones(len(all_leaves)) / len(all_leaves)
+        
+        # 加权采样
+        sampled_indices = np.random.choice(
+            len(all_leaves),
+            size=min(num_traces, len(all_leaves)),
+            replace=len(all_leaves) < num_traces,
+            p=weights,
+        )
+        sampled = [all_leaves[i] for i in sampled_indices]
         
         # 构建轨迹
         traces = []
@@ -510,6 +627,7 @@ class TreeRLAgentLoopWorker(AgentLoopWorker):
                 "token_ids": token_ids,
                 "log_probs": log_probs,
                 "masks": masks,
+                "reward": leaf.binary_score,  # 真实奖励
             })
         
         return traces
@@ -533,6 +651,7 @@ class TreeRLAgentLoopWorker(AgentLoopWorker):
         all_response_ids = []
         all_response_masks = []
         all_log_probs = []
+        all_rewards = []
         all_ground_truths = []
         all_data_sources = []
         
@@ -541,6 +660,7 @@ class TreeRLAgentLoopWorker(AgentLoopWorker):
             trace_ids = result["trace_ids"]
             trace_masks = result["trace_masks"]
             trace_log_probs = result["trace_log_probs"]
+            trace_rewards = result["trace_rewards"]
             ground_truth = result["ground_truth"]
             data_source = result["data_source"]
             
@@ -549,8 +669,17 @@ class TreeRLAgentLoopWorker(AgentLoopWorker):
                 all_response_ids.append(trace_ids[i])
                 all_response_masks.append(trace_masks[i])
                 all_log_probs.append(trace_log_probs[i])
+                all_rewards.append(trace_rewards[i])
                 all_ground_truths.append(ground_truth)
                 all_data_sources.append(data_source)
+        
+        if not all_prompt_ids:
+            # 返回空的 DataProto
+            return DataProto(
+                batch=TensorDict({}, batch_size=0),
+                non_tensor_batch={},
+                meta_info={},
+            )
         
         # Pad to same length
         max_prompt_len = max(len(p) for p in all_prompt_ids)
@@ -575,6 +704,14 @@ class TreeRLAgentLoopWorker(AgentLoopWorker):
             padded_masks.append(m + [0] * pad_len)
             padded_log_probs.append(lp + [0.0] * pad_len)
         
+        # 构造 token-level rewards（只在最后一个 token 给予奖励）
+        token_rewards = torch.zeros(len(padded_responses), max_response_len)
+        for i, (mask, reward) in enumerate(zip(padded_masks, all_rewards)):
+            # 找到最后一个有效 token
+            valid_len = sum(mask)
+            if valid_len > 0:
+                token_rewards[i, valid_len - 1] = reward
+        
         # 构造 DataProto
         batch = TensorDict({
             "prompts": torch.tensor(padded_prompts),
@@ -583,6 +720,7 @@ class TreeRLAgentLoopWorker(AgentLoopWorker):
             "rollout_log_probs": torch.tensor(padded_log_probs),
             "input_ids": torch.tensor([p + r for p, r in zip(padded_prompts, padded_responses)]),
             "attention_mask": torch.ones(len(padded_prompts), max_prompt_len + max_response_len),
+            "token_level_scores": token_rewards,
         }, batch_size=len(padded_prompts))
         
         # 添加 non_tensor_batch 用于奖励计算
