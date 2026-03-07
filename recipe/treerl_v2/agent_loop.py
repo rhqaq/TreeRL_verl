@@ -18,7 +18,7 @@ import torch
 from omegaconf import DictConfig
 from tensordict import TensorDict
 
-from verl.experimental.agent_loop import AgentLoopManager, AgentLoopWorker
+from verl.experimental.agent_loop import AgentLoopManager, AgentLoopWorkerBase
 from verl.protocol import DataProto
 from verl.utils.reward_score import math_dapo
 
@@ -267,9 +267,12 @@ class TreeRLAgentLoopManager(AgentLoopManager):
 # TreeRL AgentLoopWorker
 # ==============================================================================
 @ray.remote
-class TreeRLAgentLoopWorker(AgentLoopWorker):
+class TreeRLAgentLoopWorker(AgentLoopWorkerBase):
     """
     TreeRL 的 AgentLoopWorker 实现。
+    
+    继承自 AgentLoopWorkerBase（普通类），然后用 @ray.remote 装饰。
+    Ray 不支持继承一个已经是 @ray.remote 装饰的类，所以我们继承基类。
     
     核心方法 generate_sequences_tree_search 实现树搜索逻辑。
     """
