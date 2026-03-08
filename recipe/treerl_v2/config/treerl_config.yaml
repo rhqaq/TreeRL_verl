@@ -1,5 +1,19 @@
-# TreeRL 配置文件示例
+# TreeRL 配置文件
 # 使用方法：python -m recipe.treerl_v2.main_treerl --config-path=config --config-name=treerl_config
+
+# ==============================================================================
+# Hydra 配置 - 指定搜索路径和默认配置
+# ==============================================================================
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+# ==============================================================================
+# 默认配置 - 继承 ppo_trainer 的所有默认值
+# ==============================================================================
+defaults:
+  - ppo_trainer
+  - _self_
 
 # ==============================================================================
 # 数据配置
@@ -83,7 +97,7 @@ actor_rollout_ref:
       num_workers: 1
 
 # ==============================================================================
-# Critic 配置（TreeRL 不使用 Critic）
+# Critic 配置（TreeRL 不使用 Critic，使用 RLOO）
 # ==============================================================================
 critic:
   model:
@@ -116,8 +130,7 @@ algorithm:
 # 奖励模型配置
 # ==============================================================================
 reward_model:
-  enable: false  # 使用 reward_manager 而不是 reward model
-  reward_manager: dapo
+  enable: false  # 使用 math_dapo.compute_score 而不是 reward model
   use_reward_loop: false
   reward_kwargs:
     overlong_buffer_cfg:
@@ -144,4 +157,3 @@ trainer:
   total_epochs: 10
   default_local_dir: /tmp/treerl/ckpts
   resume_mode: auto
-  device: npu
